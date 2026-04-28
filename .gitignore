@@ -1,0 +1,7 @@
+.env
+.env.local
+
+.idea
+node_modules/
+output/
+package-lock.json
