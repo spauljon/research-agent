@@ -221,8 +221,8 @@ async function handleWriteReport(input: {
   filename: string;
   content: string;
 }): Promise<string> {
-  const fs = await import("fs/promises");
-  const path = await import("path");
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
   const outputPath = path.join(process.cwd(), "output", input.filename);
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
   await fs.writeFile(outputPath, input.content, "utf-8");
@@ -248,6 +248,92 @@ async function dispatchTool(
   }
 }
 
+// ─── Cost tracking ────────────────────────────────────────────────────────────
+//
+// Tracks token usage across all API calls in a pipeline run, computes USD
+// cost from a model price table, and halts the pipeline before exceeding a
+// configurable cap.
+//
+// Two-layer cost discipline:
+//   1. This in-code tracker — per-run cap, advisory but immediate
+//   2. Anthropic console limits — monthly cap, authoritative safety net
+// The console limit should be set well above the in-code limit so it only
+// fires if something is genuinely broken.
+//
+// Prices below were correct on 2026-04-29 — verify against
+// https://www.anthropic.com/pricing if you change models.
+
+interface ModelPricing {
+  input: number;       // USD per million input tokens
+  output: number;      // USD per million output tokens
+  cacheWrite: number;  // USD per million cache-write tokens
+  cacheRead: number;   // USD per million cache-read tokens
+}
+
+const PRICING: Record<string, ModelPricing> = {
+  "claude-opus-4-7":   { input: 5,  output: 25, cacheWrite: 6.25, cacheRead: 0.50 },
+  "claude-opus-4-6":   { input: 5,  output: 25, cacheWrite: 6.25, cacheRead: 0.50 },
+  "claude-opus-4-5":   { input: 5,  output: 25, cacheWrite: 6.25, cacheRead: 0.50 },
+  "claude-sonnet-4-6": { input: 3,  output: 15, cacheWrite: 3.75, cacheRead: 0.30 },
+  "claude-haiku-4-5":  { input: 1,  output:  5, cacheWrite: 1.25, cacheRead: 0.10 },
+};
+
+class SpendCapExceeded extends Error {
+  constructor(public spent: number, public cap: number) {
+    super(
+      `Spend cap exceeded: $${spent.toFixed(4)} > $${cap.toFixed(2)}. ` +
+      `Pipeline halted. Increase MAX_SPEND_USD to continue.`
+    );
+    this.name = "SpendCapExceeded";
+  }
+}
+
+class CostTracker {
+  private totalUsd = 0;
+  private callCount = 0;
+
+  constructor(
+    private readonly model: string,
+    private readonly capUsd: number
+  ) {
+    if (!PRICING[model]) {
+      throw new Error(
+        `No pricing entry for model "${model}". Add it to PRICING or pick a known model.`
+      );
+    }
+  }
+
+  /** Throw if the current spend already exceeds the cap. Call before each API request. */
+  preflight(): void {
+    if (this.totalUsd >= this.capUsd) {
+      throw new SpendCapExceeded(this.totalUsd, this.capUsd);
+    }
+  }
+
+  /** Record actual usage from a completed API response. */
+  record(usage: Anthropic.Usage): void {
+    const price = PRICING[this.model]!;
+    const inputCost  = (usage.input_tokens                   / 1_000_000) * price.input;
+    const outputCost = (usage.output_tokens                  / 1_000_000) * price.output;
+    const writeCost  = ((usage.cache_creation_input_tokens ?? 0) / 1_000_000) * price.cacheWrite;
+    const readCost   = ((usage.cache_read_input_tokens     ?? 0) / 1_000_000) * price.cacheRead;
+    const callCost   = inputCost + outputCost + writeCost + readCost;
+
+    this.totalUsd += callCost;
+    this.callCount++;
+
+    console.log(
+      `  [cost] +$${callCost.toFixed(4)} ` +
+      `(in:${usage.input_tokens} out:${usage.output_tokens}) ` +
+      `→ run total $${this.totalUsd.toFixed(4)} / $${this.capUsd.toFixed(2)}`
+    );
+  }
+
+  summary(): string {
+    return `${this.callCount} API call${this.callCount === 1 ? "" : "s"}, $${this.totalUsd.toFixed(4)} spent (cap $${this.capUsd.toFixed(2)})`;
+  }
+}
+
 // ─── Agentic loop ─────────────────────────────────────────────────────────────
 //
 // Runs Claude with the given tools until it stops calling them.
@@ -259,13 +345,181 @@ async function dispatchTool(
 // final JSON. This avoids round-tripping tens of thousands of characters
 // through the API (which previously caused max_tokens overruns).
 
+const MODEL = "claude-haiku-4-5";
+
 interface AgentLoopResult {
   finalText: string;
   fetchedContent: Map<string, string>; // url → raw extracted text
 }
 
+/**
+ * Wraps client.messages.create with:
+ *   1. One additional explicit retry on 429 that respects the Retry-After header
+ *      (the SDK already auto-retries via maxRetries; this is a final safety net
+ *      with full visibility — you SEE the wait, you don't just get a slow call)
+ *   2. Logging of remaining rate-limit budget when it drops below a threshold,
+ *      so you can spot pressure building before you hit a wall
+ */
+async function callClaudeWithBackoff(
+  client: Anthropic,
+  request: Anthropic.MessageCreateParamsNonStreaming,
+  stageName: string
+): Promise<Anthropic.Message> {
+  const MAX_RETRY_AFTER_SECONDS = 90; // refuse waits longer than this — bail with a clear error
+
+  const attemptOnce = async () => {
+    // .withResponse() returns both the parsed message and the raw HTTP response,
+    // so we can read the rate-limit headers
+    const { data, response } = await client.messages
+      .create(request)
+      .withResponse();
+
+    const reqRemaining = Number(
+      response.headers.get("anthropic-ratelimit-requests-remaining") ?? -1
+    );
+    const itpmRemaining = Number(
+      response.headers.get("anthropic-ratelimit-input-tokens-remaining") ?? -1
+    );
+
+    // Warn when we're getting close — values of -1 mean header not present
+    if (reqRemaining >= 0 && reqRemaining <= 2) {
+      console.log(`  [rate] ⚠ requests remaining this minute: ${reqRemaining}`);
+    }
+    if (itpmRemaining >= 0 && itpmRemaining < 5000) {
+      console.log(`  [rate] ⚠ input tokens remaining this minute: ${itpmRemaining}`);
+    }
+
+    return data;
+  };
+
+  try {
+    return await attemptOnce();
+  } catch (err) {
+    // The SDK throws RateLimitError specifically for 429s
+    if (!(err instanceof Anthropic.RateLimitError)) throw err;
+
+    // Read the Retry-After header — it can be in seconds or as an HTTP date
+    const retryAfterRaw = err.headers?.["retry-after"];
+    const retryAfterSec = Number(retryAfterRaw) || 30; // fallback to 30s
+
+    if (retryAfterSec > MAX_RETRY_AFTER_SECONDS) {
+      throw new Error(
+        `Stage "${stageName}" rate-limited with retry-after ${retryAfterSec}s ` +
+        `(exceeds ${MAX_RETRY_AFTER_SECONDS}s threshold). ` +
+        `Consider reducing prompt size, switching tier, or using a different model.`
+      );
+    }
+
+    console.log(
+      `  [rate] 429 received in stage "${stageName}". ` +
+      `Waiting ${retryAfterSec}s per Retry-After header before final attempt...`
+    );
+    await new Promise((resolve) => setTimeout(resolve, retryAfterSec * 1000));
+
+    // One more attempt — if THIS one 429s, let it propagate
+    return attemptOnce();
+  }
+}
+
+// What `interpretStopReason` returns. The loop uses this to decide whether to
+// return a final result, throw, or keep going.
+type StopInterpretation =
+  | { kind: "done"; finalText: string }
+  | { kind: "continue" };
+
+/**
+ * Inspects a response's stop_reason and decides how the loop should react.
+ * Throws on anything unexpected — that's our "fail loud" defence against silent
+ * weirdness like `max_tokens` overruns or unknown reasons from future API versions.
+ */
+function interpretStopReason(
+  response: Anthropic.Message,
+  stageName: string
+): StopInterpretation {
+  if (response.stop_reason === "end_turn") {
+    const textBlock = response.content.find((b) => b.type === "text");
+    return { kind: "done", finalText: textBlock ? textBlock.text : "" };
+  }
+
+  if (response.stop_reason === "max_tokens") {
+    throw new Error(
+      `Stage "${stageName}" hit max_tokens. Increase max_tokens or reduce work per stage.`
+    );
+  }
+
+  if (response.stop_reason !== "tool_use") {
+    throw new Error(
+      `Unexpected stop_reason in stage "${stageName}": ${response.stop_reason}`
+    );
+  }
+
+  return { kind: "continue" };
+}
+
+/**
+ * Processes a single tool_use block: calls the tool, captures any side-effect
+ * state (currently: fetched URL content into the Map), and returns the result
+ * block to send back to Claude. Errors from the tool are converted into
+ * `is_error: true` tool results so Claude can adapt rather than the loop crashing.
+ */
+async function processToolUseBlock(
+  block: Anthropic.ToolUseBlock,
+  fetchedContent: Map<string, string>
+): Promise<Anthropic.ToolResultBlockParam> {
+  try {
+    const result = await dispatchTool(
+      block.name,
+      block.input as Record<string, unknown>
+    );
+
+    // Side effect: stash fetched content keyed by URL so the pipeline can read
+    // it directly without round-tripping through Claude.
+    if (block.name === "fetch_url") {
+      try {
+        const parsed = JSON.parse(result);
+        if (parsed.content && parsed.url) {
+          fetchedContent.set(parsed.url, parsed.content);
+        }
+      } catch {
+        // ignore — non-JSON or malformed result
+      }
+    }
+
+    return {
+      type: "tool_result",
+      tool_use_id: block.id,
+      content: result,
+    };
+  } catch (err) {
+    return {
+      type: "tool_result",
+      tool_use_id: block.id,
+      content: `Error: ${err instanceof Error ? err.message : String(err)}`,
+      is_error: true,
+    };
+  }
+}
+
+/**
+ * Iterates the tool_use blocks in a response and produces the corresponding
+ * tool_result blocks to send back. Non-tool_use blocks are skipped silently
+ * (they're typically text blocks Claude adds alongside its tool calls).
+ */
+async function executeToolCalls(
+  response: Anthropic.Message,
+  fetchedContent: Map<string, string>
+): Promise<Anthropic.ToolResultBlockParam[]> {
+  const results: Anthropic.ToolResultBlockParam[] = [];
+  for (const block of response.content) {
+    if (block.type !== "tool_use") continue;
+    results.push(await processToolUseBlock(block, fetchedContent));
+  }
+  return results;
+}
+
 async function runAgentLoop(
   client: Anthropic,
+  tracker: CostTracker,
   systemPrompt: string,
   userMessage: string,
   stageName: string
@@ -278,81 +532,34 @@ async function runAgentLoop(
   const fetchedContent = new Map<string, string>();
 
   while (true) {
-    const response = await client.messages.create({
-      model: "claude-opus-4-5",
-      max_tokens: 8192, // bumped from 4096 to give stages more room
-      system: systemPrompt,
-      tools: TOOLS,
-      messages,
-    });
+    tracker.preflight();
 
+    const response = await callClaudeWithBackoff(
+      client,
+      {
+        model: MODEL,
+        max_tokens: 8192,
+        system: systemPrompt,
+        tools: TOOLS,
+        messages,
+      },
+      stageName
+    );
+
+    tracker.record(response.usage);
     messages.push({ role: "assistant", content: response.content });
 
-    // Defensive stop_reason handling — fail loudly on anything unexpected
-    if (response.stop_reason === "end_turn") {
-      const textBlock = response.content.find((b) => b.type === "text");
-      return {
-        finalText: textBlock ? textBlock.text : "",
-        fetchedContent,
-      };
+    const next = interpretStopReason(response, stageName);
+    if (next.kind === "done") {
+      return { finalText: next.finalText, fetchedContent };
     }
 
-    if (response.stop_reason === "max_tokens") {
-      throw new Error(
-        `Stage "${stageName}" hit max_tokens. Increase max_tokens or reduce work per stage.`
-      );
-    }
-
-    if (response.stop_reason !== "tool_use") {
-      throw new Error(
-        `Unexpected stop_reason in stage "${stageName}": ${response.stop_reason}`
-      );
-    }
-
-    // Build tool results — and capture fetched content into the Map as a side effect
-    const toolResults: Anthropic.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
-      try {
-        const result = await dispatchTool(
-          block.name,
-          block.input as Record<string, unknown>
-        );
-
-        // If this was a fetch_url call that succeeded, stash the content
-        if (block.name === "fetch_url") {
-          try {
-            const parsed = JSON.parse(result);
-            if (parsed.content && parsed.url) {
-              fetchedContent.set(parsed.url, parsed.content);
-            }
-          } catch {
-            // ignore — non-JSON or malformed result
-          }
-        }
-
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: block.id,
-          content: result,
-        });
-      } catch (err) {
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: block.id,
-          content: `Error: ${err instanceof Error ? err.message : String(err)}`,
-          is_error: true,
-        });
-      }
-    }
-
-    // Belt-and-braces: never push empty content — that triggers a 400 from the API
+    const toolResults = await executeToolCalls(response, fetchedContent);
     if (toolResults.length === 0) {
       throw new Error(
         `No tool results to send back in stage "${stageName}" — Claude indicated tool_use but produced no tool_use blocks`
       );
     }
-
     messages.push({ role: "user", content: toolResults });
   }
 }
@@ -361,6 +568,7 @@ async function runAgentLoop(
 
 async function stageSearch(
   client: Anthropic,
+  tracker: CostTracker,
   query: string
 ): Promise<StageResult> {
   const systemPrompt = `You are a research assistant in the first stage of a multi-stage pipeline.
@@ -380,6 +588,7 @@ to confirm which URLs you want to include in the final source list.`;
 
   const result = await runAgentLoop(
     client,
+    tracker,
     systemPrompt,
     `Find sources for this research query: "${query}"`,
     "1 · Search & fetch"
@@ -431,6 +640,7 @@ to confirm which URLs you want to include in the final source list.`;
 
 async function stageAnalyse(
   client: Anthropic,
+  tracker: CostTracker,
   query: string,
   sources: Source[]
 ): Promise<StageResult> {
@@ -460,6 +670,7 @@ Analyse these sources and return structured JSON.`;
 
   const result = await runAgentLoop(
     client,
+    tracker,
     systemPrompt,
     userMessage,
     "2 · Analyse"
@@ -480,6 +691,7 @@ Analyse these sources and return structured JSON.`;
 
 async function stageSynthesize(
   client: Anthropic,
+  tracker: CostTracker,
   query: string,
   sources: Source[],
   analysis: unknown
@@ -509,6 +721,7 @@ Write the report and save it as report.md.`;
 
   const result = await runAgentLoop(
     client,
+    tracker,
     systemPrompt,
     userMessage,
     "3 · Synthesise & write"
@@ -520,51 +733,75 @@ Write the report and save it as report.md.`;
 // ─── Main pipeline ─────────────────────────────────────────────────────────────
 
 async function runResearchPipeline(query: string): Promise<void> {
-  const client = new Anthropic();
+  // maxRetries: SDK auto-retries 429/529 with exponential backoff.
+  // Default is 2; we bump to 5 for agentic workloads where short bursts
+  // can briefly exceed per-minute limits even on a paid tier.
+  const client = new Anthropic({ maxRetries: 5 });
+
+  // Spend cap configurable via env, defaults to $2.50 per pipeline run
+  const capUsd = Number(process.env.MAX_SPEND_USD ?? "2.50");
+  if (!Number.isFinite(capUsd) || capUsd <= 0) {
+    throw new Error(`Invalid MAX_SPEND_USD: ${process.env.MAX_SPEND_USD}`);
+  }
+  const tracker = new CostTracker(MODEL, capUsd);
 
   console.log(`\n╔══════════════════════════════════════════╗`);
   console.log(`║  Research Agent — Multi-stage Pipeline   ║`);
   console.log(`╚══════════════════════════════════════════╝`);
-  console.log(`Query: "${query}"\n`);
+  console.log(`Query: "${query}"`);
+  console.log(`Model: ${MODEL}   Spend cap: $${capUsd.toFixed(2)}\n`);
 
   const state: Partial<PipelineState> = { query };
   const results: StageResult[] = [];
 
-  const searchResult = await stageSearch(client, query);
-  results.push(searchResult);
-  if (!searchResult.success) {
-    console.error(`\n✗ Pipeline aborted at stage 1: ${searchResult.error}`);
-    return;
-  }
-  state.sources = searchResult.data as Source[];
-  console.log(`✓ Fetched ${state.sources.length} sources`);
+  try {
+    const searchResult = await stageSearch(client, tracker, query);
+    results.push(searchResult);
+    if (!searchResult.success) {
+      console.error(`\n✗ Pipeline aborted at stage 1: ${searchResult.error}`);
+      return;
+    }
+    state.sources = searchResult.data as Source[];
+    console.log(`✓ Fetched ${state.sources.length} sources`);
 
-  const analyseResult = await stageAnalyse(client, query, state.sources);
-  results.push(analyseResult);
-  if (!analyseResult.success) {
-    console.error(`\n✗ Pipeline aborted at stage 2: ${analyseResult.error}`);
-    return;
-  }
-  state.analysis = analyseResult.data as string;
-  console.log(`✓ Analysis complete`);
+    const analyseResult = await stageAnalyse(client, tracker, query, state.sources);
+    results.push(analyseResult);
+    if (!analyseResult.success) {
+      console.error(`\n✗ Pipeline aborted at stage 2: ${analyseResult.error}`);
+      return;
+    }
+    state.analysis = analyseResult.data as string;
+    console.log(`✓ Analysis complete`);
 
-  const synthResult = await stageSynthesize(
-    client,
-    query,
-    state.sources,
-    state.analysis
-  );
-  results.push(synthResult);
-  if (!synthResult.success) {
-    console.error(`\n✗ Pipeline aborted at stage 3: ${synthResult.error}`);
-    return;
-  }
-  console.log(`✓ Report written`);
+    const synthResult = await stageSynthesize(
+      client,
+      tracker,
+      query,
+      state.sources,
+      state.analysis
+    );
+    results.push(synthResult);
+    if (!synthResult.success) {
+      console.error(`\n✗ Pipeline aborted at stage 3: ${synthResult.error}`);
+      return;
+    }
+    console.log(`✓ Report written`);
 
-  console.log(`\n── Pipeline complete ──`);
-  console.log(`Stages run: ${results.length}`);
-  console.log(`All succeeded: ${results.every((r) => r.success)}`);
-  console.log(`Output: ./output/report.md\n`);
+    console.log(`\n── Pipeline complete ──`);
+    console.log(`Stages run: ${results.length}`);
+    console.log(`All succeeded: ${results.every((r) => r.success)}`);
+    console.log(`Cost:    ${tracker.summary()}`);
+    console.log(`Output:  ./output/report.md\n`);
+  } catch (err) {
+    if (err instanceof SpendCapExceeded) {
+      console.error(`\n💰 ${err.message}`);
+      console.error(`Stages completed before halt: ${results.filter((r) => r.success).length}`);
+      console.error(`Cost: ${tracker.summary()}`);
+      console.error(`Tip: re-run with MAX_SPEND_USD=<higher> to continue.\n`);
+      return;
+    }
+    throw err;
+  }
 }
 
 // ─── Entry point ───────────────────────────────────────────────────────────────
