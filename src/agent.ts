@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { MODEL } from "./config.js";
 import { CostTracker, SpendCapExceeded } from "./cost-tracker.js";
+import { stageReformulate } from "./stages/reformulate.js";
 import { stageSearch } from "./stages/search.js";
 import { stageAnalyse } from "./stages/analyse.js";
 import { stageSynthesize } from "./stages/synthesize.js";
@@ -29,7 +30,18 @@ async function runResearchPipeline(query: string): Promise<void> {
   const results: StageResult[] = [];
 
   try {
-    const searchResult = await stageSearch(client, tracker, query);
+    const reformulateResult = await stageReformulate(client, tracker, query);
+    results.push(reformulateResult);
+    const researchQuery =
+      reformulateResult.success && typeof reformulateResult.data === "string"
+        ? reformulateResult.data
+        : query;
+
+    if (researchQuery !== query) {
+      console.log(`Reformulated query: "${researchQuery}"\n`);
+    }
+
+    const searchResult = await stageSearch(client, tracker, researchQuery);
     results.push(searchResult);
     if (!searchResult.success) {
       logger.error({ stage: 1, error: searchResult.error }, "pipeline aborted");
@@ -38,7 +50,7 @@ async function runResearchPipeline(query: string): Promise<void> {
     const sources = searchResult.data as Source[];
     logger.info({ sourceCount: sources.length }, "stage 1 complete");
 
-    const analyseResult = await stageAnalyse(client, tracker, query, sources);
+    const analyseResult = await stageAnalyse(client, tracker, researchQuery, sources);
     results.push(analyseResult);
     if (!analyseResult.success) {
       logger.error({ stage: 2, error: analyseResult.error }, "pipeline aborted");
@@ -49,7 +61,7 @@ async function runResearchPipeline(query: string): Promise<void> {
     const synthResult = await stageSynthesize(
       client,
       tracker,
-      query,
+      researchQuery,
       sources,
       analyseResult.data
     );

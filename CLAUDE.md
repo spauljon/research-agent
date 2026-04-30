@@ -24,6 +24,11 @@ The pipeline:
 Query
   │
   ▼
+Stage 0 — Reformulate             no tools (pure reasoning)
+  │  Improve a vague query before searching. Falls back to
+  │  original if the call fails.
+  │
+  ▼
 Stage 1 — Search & Fetch          tools: search_web, fetch_url
   │  Find URLs, fetch content. Return [{url, title}].
   │  Content is captured by the loop, NOT echoed through Claude.
@@ -113,11 +118,11 @@ deployment environments without modification.
 - Structured logging via pino — info-level to stdout (pretty in TTY, JSON
   otherwise); full debug-level message history written to
   `./output/run-<timestamp>.log` each run. Override log level with `LOG_LEVEL`.
+- **Stage 0 — query reformulation.** Single-turn Haiku call (`stages/reformulate.ts`)
+  improves vague queries before Stage 1 runs. Falls back to the original query on
+  failure. Prints the reformulated query in the header when it differs.
 
 **Not yet done (in roughly the order I plan to tackle them):**
-
-- **Stage 0 — query reformulation.** Use Claude to improve a vague user query
-  before Stage 1 runs. First taste of agent self-improvement.
 - **Checkpointing for resumability.** A crashed pipeline should be able to
   resume from the last completed stage rather than starting over. This is the
   on-ramp to the broader "MEMORY.md / persistent state" pattern.
@@ -143,6 +148,7 @@ src/
     fetch-url.ts            ← handleFetchUrl, Tavily extract client
     write-report.ts         ← handleWriteReport
   stages/
+    reformulate.ts          ← stageReformulate
     search.ts               ← stageSearch
     analyse.ts              ← stageAnalyse
     synthesize.ts           ← stageSynthesize
