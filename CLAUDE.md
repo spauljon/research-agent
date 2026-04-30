@@ -121,11 +121,10 @@ deployment environments without modification.
 - **Stage 0 — query reformulation.** Single-turn Haiku call (`stages/reformulate.ts`)
   improves vague queries before Stage 1 runs. Falls back to the original query on
   failure. Prints the reformulated query in the header when it differs.
-
-**Not yet done (in roughly the order I plan to tackle them):**
-- **Checkpointing for resumability.** A crashed pipeline should be able to
-  resume from the last completed stage rather than starting over. This is the
-  on-ramp to the broader "MEMORY.md / persistent state" pattern.
+- **Checkpointing for resumability.** After each stage succeeds, `src/checkpoint.ts`
+  writes `./output/checkpoint-<hash>.json`. Re-running the same query resumes from
+  the last completed stage. Checkpoint is cleared on full pipeline success; survives
+  `SpendCapExceeded` so re-running with a higher cap continues where it left off.
 
 ---
 
@@ -152,7 +151,8 @@ src/
     search.ts               ← stageSearch
     analyse.ts              ← stageAnalyse
     synthesize.ts           ← stageSynthesize
-  types.ts                  ← shared interfaces (Source, StageResult, etc.)
+  types.ts                  ← shared interfaces (Source, StageResult, Checkpoint, etc.)
+  checkpoint.ts             ← loadCheckpoint, saveCheckpoint, clearCheckpoint
 ```
 
 Principles for the split:

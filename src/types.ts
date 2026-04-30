@@ -12,6 +12,17 @@ export interface PipelineState {
   report: string;
 }
 
+export interface Checkpoint {
+  version: 1;
+  originalQuery: string;
+  createdAt: string;
+  updatedAt: string;
+  completedStages: number[];
+  reformulatedQuery: string | null;
+  sources: Source[] | null;
+  analysis: unknown | null;
+}
+
 export interface StageResult {
   stage: string;
   success: boolean;
