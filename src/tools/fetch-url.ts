@@ -35,8 +35,10 @@ async function tavilyExtract(url: string): Promise<TavilyExtractResponse> {
   return response.json() as Promise<TavilyExtractResponse>;
 }
 
+import { logger } from "../logger.js";
+
 export async function handleFetchUrl(input: { url: string }): Promise<string> {
-  console.log(`  [tool] fetch_url: ${input.url}`);
+  logger.info({ url: input.url }, "tool: fetch_url");
   const data = await tavilyExtract(input.url);
 
   if (data.failed_results.length > 0) {

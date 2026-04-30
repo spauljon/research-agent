@@ -42,11 +42,13 @@ async function tavilySearch(
   return response.json() as Promise<TavilySearchResponse>;
 }
 
+import { logger } from "../logger.js";
+
 export async function handleSearchWeb(input: {
   query: string;
   num_results?: number;
 }): Promise<string> {
-  console.log(`  [tool] search_web: "${input.query}"`);
+  logger.info({ query: input.query }, "tool: search_web");
   const data = await tavilySearch(input.query, input.num_results ?? 3);
 
   const slim = data.results.map((r) => ({

@@ -1,5 +1,6 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { PRICING } from "./pricing.js";
+import { logger } from "./logger.js";
 
 export class SpendCapExceeded extends Error {
   constructor(public spent: number, public cap: number) {
@@ -45,10 +46,15 @@ export class CostTracker {
     this.totalUsd += callCost;
     this.callCount++;
 
-    console.log(
-      `  [cost] +$${callCost.toFixed(4)} ` +
-      `(in:${usage.input_tokens} out:${usage.output_tokens}) ` +
-      `→ run total $${this.totalUsd.toFixed(4)} / $${this.capUsd.toFixed(2)}`
+    logger.info(
+      {
+        callCost: Number(callCost.toFixed(4)),
+        inputTokens: usage.input_tokens,
+        outputTokens: usage.output_tokens,
+        totalUsd: Number(this.totalUsd.toFixed(4)),
+        capUsd: this.capUsd,
+      },
+      "api call cost"
     );
   }
 

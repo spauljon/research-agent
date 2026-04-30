@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { CostTracker } from "../cost-tracker.js";
 import { runAgentLoop } from "../agent-loop.js";
+import { logger } from "../logger.js";
 import type { Source, StageResult } from "../types.js";
 
 const SYSTEM_PROMPT = `You are a research assistant in the first stage of a multi-stage pipeline.
@@ -44,9 +45,7 @@ export async function stageSearch(
     for (const cs of claudeSources) {
       const content = result.fetchedContent.get(cs.url);
       if (!content) {
-        console.warn(
-          `  ⚠ Skipping ${cs.url} — Claude listed it but no content was captured`
-        );
+        logger.warn({ url: cs.url }, "skipping source — no content captured for this URL");
         continue;
       }
       sources.push({

@@ -110,15 +110,12 @@ deployment environments without modification.
   reasons rather than silently corrupting state
 - Refactored agent loop into named helpers (`interpretStopReason`,
   `processToolUseBlock`, `executeToolCalls`) to keep cognitive complexity low
+- Structured logging via pino — info-level to stdout (pretty in TTY, JSON
+  otherwise); full debug-level message history written to
+  `./output/run-<timestamp>.log` each run. Override log level with `LOG_LEVEL`.
 
 **Not yet done (in roughly the order I plan to tackle them):**
 
-- **Multi-module refactor.** Currently everything is in `src/agent.ts`. The
-  natural split: `agent-loop.ts`, `cost-tracker.ts`, `pricing.ts`,
-  `tools/`, `stages/`, `types.ts`. See "Refactor goal" below.
-- **Rigorous logging.** Today's logs are useful but ad-hoc. Want a proper
-  logging module that records the full message history at each loop iteration
-  for debugging and learning.
 - **Stage 0 — query reformulation.** Use Claude to improve a vague user query
   before Stage 1 runs. First taste of agent self-improvement.
 - **Checkpointing for resumability.** A crashed pipeline should be able to

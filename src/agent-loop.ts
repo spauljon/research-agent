@@ -2,6 +2,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import { MODEL } from "./config.js";
 import { CostTracker } from "./cost-tracker.js";
 import { TOOLS, dispatchTool } from "./tools/index.js";
+import { logger } from "./logger.js";
+import type { Logger } from "./logger.js";
 import type { AgentLoopResult } from "./types.js";
 
 // Internal to this module — nothing outside needs to know the loop's decision type.
@@ -37,10 +39,10 @@ export async function callClaudeWithBackoff(
     );
 
     if (reqRemaining >= 0 && reqRemaining <= 2) {
-      console.log(`  [rate] ⚠ requests remaining this minute: ${reqRemaining}`);
+      logger.warn({ stage: stageName, reqRemaining }, "rate limit: requests running low");
     }
     if (itpmRemaining >= 0 && itpmRemaining < 5000) {
-      console.log(`  [rate] ⚠ input tokens remaining this minute: ${itpmRemaining}`);
+      logger.warn({ stage: stageName, itpmRemaining }, "rate limit: input tokens running low");
     }
 
     return data;
@@ -62,9 +64,9 @@ export async function callClaudeWithBackoff(
       );
     }
 
-    console.log(
-      `  [rate] 429 received in stage "${stageName}". ` +
-      `Waiting ${retryAfterSec}s per Retry-After header before final attempt...`
+    logger.warn(
+      { stage: stageName, retryAfterSec },
+      "rate limited — waiting before final retry"
     );
     await new Promise((resolve) => setTimeout(resolve, retryAfterSec * 1000));
 
@@ -98,8 +100,10 @@ function interpretStopReason(
 
 async function processToolUseBlock(
   block: Anthropic.ToolUseBlock,
-  fetchedContent: Map<string, string>
+  fetchedContent: Map<string, string>,
+  log: Logger
 ): Promise<Anthropic.ToolResultBlockParam> {
+  log.debug({ tool: block.name, input: block.input }, "tool call");
   try {
     const result = await dispatchTool(
       block.name,
@@ -119,12 +123,15 @@ async function processToolUseBlock(
       }
     }
 
+    log.debug({ tool: block.name, toolUseId: block.id }, "tool result ok");
     return { type: "tool_result", tool_use_id: block.id, content: result };
   } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log.debug({ tool: block.name, toolUseId: block.id, err: message }, "tool result error");
     return {
       type: "tool_result",
       tool_use_id: block.id,
-      content: `Error: ${err instanceof Error ? err.message : String(err)}`,
+      content: `Error: ${message}`,
       is_error: true,
     };
   }
@@ -132,12 +139,13 @@ async function processToolUseBlock(
 
 async function executeToolCalls(
   response: Anthropic.Message,
-  fetchedContent: Map<string, string>
+  fetchedContent: Map<string, string>,
+  log: Logger
 ): Promise<Anthropic.ToolResultBlockParam[]> {
   const results: Anthropic.ToolResultBlockParam[] = [];
   for (const block of response.content) {
     if (block.type !== "tool_use") continue;
-    results.push(await processToolUseBlock(block, fetchedContent));
+    results.push(await processToolUseBlock(block, fetchedContent, log));
   }
   return results;
 }
@@ -149,15 +157,21 @@ export async function runAgentLoop(
   userMessage: string,
   stageName: string
 ): Promise<AgentLoopResult> {
-  console.log(`\n── Stage: ${stageName} ──`);
+  const log = logger.child({ stage: stageName });
+  log.info("stage start");
 
   const messages: Anthropic.MessageParam[] = [
     { role: "user", content: userMessage },
   ];
   const fetchedContent = new Map<string, string>();
+  let iteration = 0;
 
   while (true) {
     tracker.preflight();
+    iteration++;
+
+    // Full message history logged at debug — goes to the run log file, not stdout.
+    log.debug({ iteration, messageCount: messages.length, messages }, "claude request");
 
     const response = await callClaudeWithBackoff(
       client,
@@ -166,14 +180,20 @@ export async function runAgentLoop(
     );
 
     tracker.record(response.usage);
+    log.debug(
+      { iteration, usage: response.usage, stopReason: response.stop_reason },
+      "claude response"
+    );
+
     messages.push({ role: "assistant", content: response.content });
 
     const next = interpretStopReason(response, stageName);
     if (next.kind === "done") {
+      log.info({ iterations: iteration }, "stage complete");
       return { finalText: next.finalText, fetchedContent };
     }
 
-    const toolResults = await executeToolCalls(response, fetchedContent);
+    const toolResults = await executeToolCalls(response, fetchedContent, log);
     if (toolResults.length === 0) {
       throw new Error(
         `No tool results to send back in stage "${stageName}" — Claude indicated tool_use but produced no tool_use blocks`

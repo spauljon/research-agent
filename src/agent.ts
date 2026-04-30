@@ -4,6 +4,7 @@ import { CostTracker, SpendCapExceeded } from "./cost-tracker.js";
 import { stageSearch } from "./stages/search.js";
 import { stageAnalyse } from "./stages/analyse.js";
 import { stageSynthesize } from "./stages/synthesize.js";
+import { logger, logPath } from "./logger.js";
 import type { Source, StageResult } from "./types.js";
 
 async function runResearchPipeline(query: string): Promise<void> {
@@ -22,7 +23,8 @@ async function runResearchPipeline(query: string): Promise<void> {
   console.log(`║  Research Agent — Multi-stage Pipeline   ║`);
   console.log(`╚══════════════════════════════════════════╝`);
   console.log(`Query: "${query}"`);
-  console.log(`Model: ${MODEL}   Spend cap: $${capUsd.toFixed(2)}\n`);
+  console.log(`Model: ${MODEL}   Spend cap: $${capUsd.toFixed(2)}`);
+  console.log(`Log:   ${logPath}\n`);
 
   const results: StageResult[] = [];
 
@@ -30,19 +32,19 @@ async function runResearchPipeline(query: string): Promise<void> {
     const searchResult = await stageSearch(client, tracker, query);
     results.push(searchResult);
     if (!searchResult.success) {
-      console.error(`\n✗ Pipeline aborted at stage 1: ${searchResult.error}`);
+      logger.error({ stage: 1, error: searchResult.error }, "pipeline aborted");
       return;
     }
     const sources = searchResult.data as Source[];
-    console.log(`✓ Fetched ${sources.length} sources`);
+    logger.info({ sourceCount: sources.length }, "stage 1 complete");
 
     const analyseResult = await stageAnalyse(client, tracker, query, sources);
     results.push(analyseResult);
     if (!analyseResult.success) {
-      console.error(`\n✗ Pipeline aborted at stage 2: ${analyseResult.error}`);
+      logger.error({ stage: 2, error: analyseResult.error }, "pipeline aborted");
       return;
     }
-    console.log(`✓ Analysis complete`);
+    logger.info("stage 2 complete");
 
     const synthResult = await stageSynthesize(
       client,
@@ -53,22 +55,32 @@ async function runResearchPipeline(query: string): Promise<void> {
     );
     results.push(synthResult);
     if (!synthResult.success) {
-      console.error(`\n✗ Pipeline aborted at stage 3: ${synthResult.error}`);
+      logger.error({ stage: 3, error: synthResult.error }, "pipeline aborted");
       return;
     }
-    console.log(`✓ Report written`);
+    logger.info("stage 3 complete");
 
-    console.log(`\n── Pipeline complete ──`);
-    console.log(`Stages run: ${results.length}`);
-    console.log(`All succeeded: ${results.every((r) => r.success)}`);
-    console.log(`Cost:    ${tracker.summary()}`);
-    console.log(`Output:  ./output/report.md\n`);
+    logger.info(
+      {
+        stagesRun: results.length,
+        allSucceeded: results.every((r) => r.success),
+        cost: tracker.summary(),
+        output: "./output/report.md",
+        log: logPath,
+      },
+      "pipeline complete"
+    );
   } catch (err) {
     if (err instanceof SpendCapExceeded) {
-      console.error(`\n💰 ${err.message}`);
-      console.error(`Stages completed before halt: ${results.filter((r) => r.success).length}`);
-      console.error(`Cost: ${tracker.summary()}`);
-      console.error(`Tip: re-run with MAX_SPEND_USD=<higher> to continue.\n`);
+      logger.error(
+        {
+          spent: err.spent,
+          cap: err.cap,
+          stagesCompleted: results.filter((r) => r.success).length,
+          tip: "re-run with MAX_SPEND_USD=<higher> to continue",
+        },
+        err.message
+      );
       return;
     }
     throw err;
