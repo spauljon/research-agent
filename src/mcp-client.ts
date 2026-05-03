@@ -10,6 +10,8 @@ export interface ResearchResult {
 }
 
 export interface SubabaseMcpClient {
+  findResearchResult(query: string): Promise<ResearchResult | null>;
+
   insertResearchResult(params: {
     query: string;
     sources: unknown;
@@ -68,6 +70,10 @@ class SupabaseMcpClientImpl implements SubabaseMcpClient {
     }
 
     return result.result;
+  }
+
+  async findResearchResult(query: string): Promise<ResearchResult | null> {
+    return (await this.callJsonRpc("find_research_result", { query })) as ResearchResult | null;
   }
 
   async insertResearchResult(params: {

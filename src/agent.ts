@@ -1,3 +1,5 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { MODEL } from "./config.js";
 import { CostTracker, SpendCapExceeded } from "./cost-tracker.js";
@@ -47,7 +49,6 @@ async function runPersistStage(
   cp: Checkpoint | null,
   mcpClient: SubabaseMcpClient | null,
   query: string,
-  researchQuery: string,
   sources: Source[],
   analysis: unknown,
   results: StageResult[]
@@ -61,7 +62,7 @@ async function runPersistStage(
     logger.warn("stage 4 skipped — MCP server unreachable");
     return;
   }
-  const result = await stagePersist(mcpClient, researchQuery, sources, analysis);
+  const result = await stagePersist(mcpClient, query, sources, analysis);
   results.push(result);
   assertStageSuccess(result, 4);
   await saveCheckpoint(query, 4, {});
@@ -96,6 +97,19 @@ async function executeStages(
     console.log(`[checkpoint] reformulate → "${researchQuery}"\n`);
   } else {
     researchQuery = await runReformulateStage(client, tracker, query, results);
+  }
+
+  // Supabase cache check — skip the pipeline if a report already exists for this query
+  if (mcpClient !== null) {
+    const existing = await mcpClient.findResearchResult(query);
+    if (existing?.report) {
+      const outDir = join(process.cwd(), "output");
+      await mkdir(outDir, { recursive: true });
+      await writeFile(join(outDir, "report.md"), existing.report, "utf-8");
+      console.log(`[supabase] Existing report found — written to ./output/report.md\n`);
+      logger.info("existing report found in Supabase, skipping pipeline");
+      return;
+    }
   }
 
   // Stage 1: Search & Fetch
@@ -141,7 +155,7 @@ async function executeStages(
   }
 
   // Stage 4: Persist
-  await runPersistStage(cp, mcpClient, query, researchQuery, sources, analysis, results);
+  await runPersistStage(cp, mcpClient, query, sources, analysis, results);
 }
 
 async function runResearchPipeline(query: string): Promise<void> {
