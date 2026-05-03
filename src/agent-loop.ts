@@ -24,7 +24,7 @@ export async function callClaudeWithBackoff(
   request: Anthropic.MessageCreateParamsNonStreaming,
   stageName: string
 ): Promise<Anthropic.Message> {
-  const MAX_RETRY_AFTER_SECONDS = 90;
+  const MAX_RETRY_AFTER_SECONDS = 900;
 
   const attemptOnce = async () => {
     const { data, response } = await client.messages

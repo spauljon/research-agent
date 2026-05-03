@@ -5,14 +5,19 @@ import { stageReformulate } from "./stages/reformulate.js";
 import { stageSearch } from "./stages/search.js";
 import { stageAnalyse } from "./stages/analyse.js";
 import { stageSynthesize } from "./stages/synthesize.js";
+import { stagePersist } from "./stages/persist.js";
+import { createMcpClient } from "./mcp-client.js";
 import { logger, logPath } from "./logger.js";
 import { loadCheckpoint, saveCheckpoint, clearCheckpoint } from "./checkpoint.js";
 import type { Checkpoint, Source, StageResult } from "./types.js";
+import type { SubabaseMcpClient } from "./mcp-client.js";
 
 const STAGE_NAMES: Record<number, string> = {
   0: "reformulate",
   1: "search",
   2: "analyse",
+  3: "synthesize",
+  4: "persist",
 };
 
 class PipelineAborted extends Error {}
@@ -22,6 +27,44 @@ function assertStageSuccess(result: StageResult, stage: number): void {
     logger.error({ stage, error: result.error }, "pipeline aborted");
     throw new PipelineAborted();
   }
+}
+
+async function runReformulateStage(
+  client: Anthropic,
+  tracker: CostTracker,
+  query: string,
+  results: StageResult[]
+): Promise<string> {
+  const result = await stageReformulate(client, tracker, query);
+  results.push(result);
+  const researchQuery = result.success && typeof result.data === "string" ? result.data : query;
+  if (researchQuery !== query) console.log(`Reformulated query: "${researchQuery}"\n`);
+  await saveCheckpoint(query, 0, { reformulatedQuery: researchQuery });
+  return researchQuery;
+}
+
+async function runPersistStage(
+  cp: Checkpoint | null,
+  mcpClient: SubabaseMcpClient | null,
+  query: string,
+  researchQuery: string,
+  sources: Source[],
+  analysis: unknown,
+  results: StageResult[]
+): Promise<void> {
+  if (cp?.completedStages.includes(4)) {
+    logger.debug("stage 4 skipped (checkpoint)");
+    console.log(`[checkpoint] persist\n`);
+    return;
+  }
+  if (mcpClient === null) {
+    logger.warn("stage 4 skipped — MCP server unreachable");
+    return;
+  }
+  const result = await stagePersist(mcpClient, researchQuery, sources, analysis);
+  results.push(result);
+  assertStageSuccess(result, 4);
+  await saveCheckpoint(query, 4, {});
 }
 
 function printBanner(query: string, cp: Checkpoint | null, capUsd: number): void {
@@ -42,7 +85,8 @@ async function executeStages(
   tracker: CostTracker,
   query: string,
   cp: Checkpoint | null,
-  results: StageResult[]
+  results: StageResult[],
+  mcpClient: SubabaseMcpClient | null
 ): Promise<void> {
   // Stage 0: Reformulate
   let researchQuery: string;
@@ -51,11 +95,7 @@ async function executeStages(
     logger.debug("stage 0 skipped (checkpoint)");
     console.log(`[checkpoint] reformulate → "${researchQuery}"\n`);
   } else {
-    const result = await stageReformulate(client, tracker, query);
-    results.push(result);
-    researchQuery = result.success && typeof result.data === "string" ? result.data : query;
-    if (researchQuery !== query) console.log(`Reformulated query: "${researchQuery}"\n`);
-    await saveCheckpoint(query, 0, { reformulatedQuery: researchQuery });
+    researchQuery = await runReformulateStage(client, tracker, query, results);
   }
 
   // Stage 1: Search & Fetch
@@ -88,11 +128,20 @@ async function executeStages(
     await saveCheckpoint(query, 2, { analysis });
   }
 
-  // Stage 3: Synthesise & Write (never skipped — idempotent side effect)
-  const result = await stageSynthesize(client, tracker, researchQuery, sources, analysis);
-  results.push(result);
-  assertStageSuccess(result, 3);
-  logger.info("stage 3 complete");
+  // Stage 3: Synthesise & Write
+  if (cp?.completedStages.includes(3)) {
+    logger.debug("stage 3 skipped (checkpoint)");
+    console.log(`[checkpoint] synthesize\n`);
+  } else {
+    const result = await stageSynthesize(client, tracker, researchQuery, sources, analysis);
+    results.push(result);
+    assertStageSuccess(result, 3);
+    logger.info("stage 3 complete");
+    await saveCheckpoint(query, 3, {});
+  }
+
+  // Stage 4: Persist
+  await runPersistStage(cp, mcpClient, query, researchQuery, sources, analysis, results);
 }
 
 async function runResearchPipeline(query: string): Promise<void> {
@@ -109,9 +158,16 @@ async function runResearchPipeline(query: string): Promise<void> {
 
   printBanner(query, cp, capUsd);
 
+  let mcpClient: SubabaseMcpClient | null = null;
+  try {
+    mcpClient = await createMcpClient(process.env.MCP_SERVER_URL);
+  } catch (err) {
+    logger.warn({ err }, "MCP server unreachable — stage 4 (persist) will be skipped");
+  }
+
   const results: StageResult[] = [];
   try {
-    await executeStages(client, tracker, query, cp, results);
+    await executeStages(client, tracker, query, cp, results, mcpClient);
     await clearCheckpoint(query);
     logger.info(
       {

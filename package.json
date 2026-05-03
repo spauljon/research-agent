@@ -4,7 +4,7 @@
   "description": "Multi-stage research agent using Anthropic tool use",
   "type": "module",
   "scripts": {
-    "start": "tsx --env-file=.env src/agent.ts",
+    "start": "tsx --env-file-if-exists=.env src/agent.ts",
     "build": "tsc"
   },
   "dependencies": {
