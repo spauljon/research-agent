@@ -9,7 +9,7 @@ export interface ResearchResult {
   created_at: string;
 }
 
-export interface SubabaseMcpClient {
+export interface SupabaseMcpClient {
   findResearchResult(query: string): Promise<ResearchResult | null>;
 
   insertResearchResult(params: {
@@ -28,7 +28,7 @@ export interface SubabaseMcpClient {
 
 // ─── Implementation ───────────────────────────────────────────────────────────
 
-class SupabaseMcpClientImpl implements SubabaseMcpClient {
+class SupabaseMcpClientImpl implements SupabaseMcpClient {
   private readonly baseUrl: string;
   private requestId = 0;
 
@@ -106,7 +106,7 @@ class SupabaseMcpClientImpl implements SubabaseMcpClient {
  * @returns A SubabaseMcpClient ready to use
  * @throws If unable to connect to the server
  */
-export async function createMcpClient(baseUrl = "http://localhost:3000"): Promise<SubabaseMcpClient> {
+export async function createMcpClient(baseUrl = "http://localhost:3000"): Promise<SupabaseMcpClient> {
   // Verify the server is reachable
   logger.info({},`[mcp-client] Connecting to Supabase MCP server at ${baseUrl}`);
 

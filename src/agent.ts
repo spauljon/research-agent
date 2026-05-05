@@ -1,8 +1,8 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import Anthropic from "@anthropic-ai/sdk";
-import { MODEL } from "./config.js";
+import { MODEL_CONFIG, MODEL_PRICING } from "./config.js";
 import { CostTracker, SpendCapExceeded } from "./cost-tracker.js";
+import { createModelAdapter } from "./model-adapters/index.js";
 import { stageReformulate } from "./stages/reformulate.js";
 import { stageSearch } from "./stages/search.js";
 import { stageAnalyse } from "./stages/analyse.js";
@@ -12,7 +12,8 @@ import { createMcpClient } from "./mcp-client.js";
 import { logger, logPath } from "./logger.js";
 import { loadCheckpoint, saveCheckpoint, clearCheckpoint } from "./checkpoint.js";
 import type { Checkpoint, Source, StageResult } from "./types.js";
-import type { SubabaseMcpClient } from "./mcp-client.js";
+import type { SupabaseMcpClient } from "./mcp-client.js";
+import type { ModelAdapter } from "./model-adapters/types.js";
 
 const STAGE_NAMES: Record<number, string> = {
   0: "reformulate",
@@ -32,12 +33,12 @@ function assertStageSuccess(result: StageResult, stage: number): void {
 }
 
 async function runReformulateStage(
-  client: Anthropic,
+  adapter: ModelAdapter,
   tracker: CostTracker,
   query: string,
   results: StageResult[]
 ): Promise<string> {
-  const result = await stageReformulate(client, tracker, query);
+  const result = await stageReformulate(adapter, tracker, query);
   results.push(result);
   const researchQuery = result.success && typeof result.data === "string" ? result.data : query;
   if (researchQuery !== query) console.log(`Reformulated query: "${researchQuery}"\n`);
@@ -47,7 +48,7 @@ async function runReformulateStage(
 
 async function runPersistStage(
   cp: Checkpoint | null,
-  mcpClient: SubabaseMcpClient | null,
+  mcpClient: SupabaseMcpClient | null,
   query: string,
   sources: Source[],
   analysis: unknown,
@@ -77,17 +78,19 @@ function printBanner(query: string, cp: Checkpoint | null, capUsd: number): void
     const doneNames = cp.completedStages.map((s) => STAGE_NAMES[s] ?? s).join(", ");
     console.log(`Resuming — completed stages: ${doneNames}`);
   }
-  console.log(`Model: ${MODEL}   Spend cap: $${capUsd.toFixed(2)}`);
+  console.log(
+    `Model: ${MODEL_CONFIG.provider}:${MODEL_CONFIG.model}   Spend cap: $${capUsd.toFixed(2)}`
+  );
   console.log(`Log:   ${logPath}\n`);
 }
 
 async function executeStages(
-  client: Anthropic,
+  adapter: ModelAdapter,
   tracker: CostTracker,
   query: string,
   cp: Checkpoint | null,
   results: StageResult[],
-  mcpClient: SubabaseMcpClient | null
+  mcpClient: SupabaseMcpClient | null
 ): Promise<void> {
   // Stage 0: Reformulate
   let researchQuery: string;
@@ -96,7 +99,7 @@ async function executeStages(
     logger.debug("stage 0 skipped (checkpoint)");
     console.log(`[checkpoint] reformulate → "${researchQuery}"\n`);
   } else {
-    researchQuery = await runReformulateStage(client, tracker, query, results);
+    researchQuery = await runReformulateStage(adapter, tracker, query, results);
   }
 
   // Supabase cache check — skip the pipeline if a report already exists for this query
@@ -119,7 +122,7 @@ async function executeStages(
     logger.debug("stage 1 skipped (checkpoint)");
     console.log(`[checkpoint] search → ${sources.length} sources\n`);
   } else {
-    const result = await stageSearch(client, tracker, researchQuery);
+    const result = await stageSearch(adapter, tracker, researchQuery);
     results.push(result);
     assertStageSuccess(result, 1);
     sources = result.data as Source[];
@@ -134,7 +137,7 @@ async function executeStages(
     logger.debug("stage 2 skipped (checkpoint)");
     console.log(`[checkpoint] analyse\n`);
   } else {
-    const result = await stageAnalyse(client, tracker, researchQuery, sources);
+    const result = await stageAnalyse(adapter, tracker, researchQuery, sources);
     results.push(result);
     assertStageSuccess(result, 2);
     analysis = result.data;
@@ -147,7 +150,7 @@ async function executeStages(
     logger.debug("stage 3 skipped (checkpoint)");
     console.log(`[checkpoint] synthesize\n`);
   } else {
-    const result = await stageSynthesize(client, tracker, researchQuery, sources, analysis);
+    const result = await stageSynthesize(adapter, tracker, researchQuery, sources, analysis);
     results.push(result);
     assertStageSuccess(result, 3);
     logger.info("stage 3 complete");
@@ -159,20 +162,21 @@ async function executeStages(
 }
 
 async function runResearchPipeline(query: string): Promise<void> {
-  // maxRetries: SDK auto-retries 429/529 with exponential backoff.
-  // Default is 2; we bump to 5 for agentic workloads where short bursts
-  // can briefly exceed per-minute limits even on a paid tier.
-  const client = new Anthropic({ maxRetries: 5 });
+  const adapter = createModelAdapter();
 
   const capUsd = Number(process.env.MAX_SPEND_USD ?? "2.50");
   if (!Number.isFinite(capUsd) || capUsd <= 0)
     throw new Error(`Invalid MAX_SPEND_USD: ${process.env.MAX_SPEND_USD}`);
-  const tracker = new CostTracker(MODEL, capUsd);
+  const tracker = new CostTracker(
+    `${MODEL_CONFIG.provider}:${MODEL_CONFIG.model}`,
+    capUsd,
+    MODEL_PRICING
+  );
   const cp = await loadCheckpoint(query);
 
   printBanner(query, cp, capUsd);
 
-  let mcpClient: SubabaseMcpClient | null = null;
+  let mcpClient: SupabaseMcpClient | null = null;
   try {
     mcpClient = await createMcpClient(process.env.MCP_SERVER_URL);
   } catch (err) {
@@ -181,7 +185,7 @@ async function runResearchPipeline(query: string): Promise<void> {
 
   const results: StageResult[] = [];
   try {
-    await executeStages(client, tracker, query, cp, results, mcpClient);
+    await executeStages(adapter, tracker, query, cp, results, mcpClient);
     await clearCheckpoint(query);
     logger.info(
       {
@@ -211,5 +215,5 @@ async function runResearchPipeline(query: string): Promise<void> {
   }
 }
 
-const query = process.argv[2] ?? "the current state of AI agent frameworks";
+const query = process.argv[2] ?? "the current state of AI agent langchain framework";
 runResearchPipeline(query).catch(console.error);

@@ -1,6 +1,6 @@
-import type Anthropic from "@anthropic-ai/sdk";
-import { PRICING } from "./pricing.js";
+import type { NormalizedUsage } from "./model-adapters/types.js";
 import { logger } from "./logger.js";
+import type { ModelPricing } from "./pricing.js";
 
 export class SpendCapExceeded extends Error {
   constructor(public spent: number, public cap: number) {
@@ -17,40 +17,55 @@ export class CostTracker {
   private callCount = 0;
 
   constructor(
-    private readonly model: string,
-    private readonly capUsd: number
+    private readonly modelLabel: string,
+    private readonly capUsd: number,
+    private readonly pricing: ModelPricing | null
   ) {
-    if (!PRICING[model]) {
-      throw new Error(
-        `No pricing entry for model "${model}". Add it to PRICING or pick a known model.`
+    if (this.pricing === null) {
+      logger.warn(
+        { model: this.modelLabel },
+        "no pricing configured for model; spend cap enforcement disabled"
       );
     }
   }
 
   // Throw if the current spend already exceeds the cap. Call before each API request.
   preflight(): void {
+    if (this.pricing === null) return;
     if (this.totalUsd >= this.capUsd) {
       throw new SpendCapExceeded(this.totalUsd, this.capUsd);
     }
   }
 
   // Record actual usage from a completed API response.
-  record(usage: Anthropic.Usage): void {
-    const price = PRICING[this.model]!;
-    const inputCost  = (usage.input_tokens                        / 1_000_000) * price.input;
-    const outputCost = (usage.output_tokens                       / 1_000_000) * price.output;
-    const writeCost  = ((usage.cache_creation_input_tokens ?? 0)  / 1_000_000) * price.cacheWrite;
-    const readCost   = ((usage.cache_read_input_tokens     ?? 0)  / 1_000_000) * price.cacheRead;
+  record(usage: NormalizedUsage): void {
+    this.callCount++;
+
+    if (this.pricing === null) {
+      logger.info(
+        {
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          model: this.modelLabel,
+        },
+        "api call usage"
+      );
+      return;
+    }
+
+    const inputCost  = (usage.inputTokens                        / 1_000_000) * this.pricing.input;
+    const outputCost = (usage.outputTokens                       / 1_000_000) * this.pricing.output;
+    const writeCost  = ((usage.cacheCreationInputTokens ?? 0)    / 1_000_000) * this.pricing.cacheWrite;
+    const readCost   = ((usage.cacheReadInputTokens ?? 0)        / 1_000_000) * this.pricing.cacheRead;
     const callCost   = inputCost + outputCost + writeCost + readCost;
 
     this.totalUsd += callCost;
-    this.callCount++;
 
     logger.info(
       {
         callCost: Number(callCost.toFixed(4)),
-        inputTokens: usage.input_tokens,
-        outputTokens: usage.output_tokens,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
         totalUsd: Number(this.totalUsd.toFixed(4)),
         capUsd: this.capUsd,
       },
@@ -59,6 +74,9 @@ export class CostTracker {
   }
 
   summary(): string {
+    if (this.pricing === null) {
+      return `${this.callCount} API call${this.callCount === 1 ? "" : "s"}, spend unavailable for ${this.modelLabel}`;
+    }
     return `${this.callCount} API call${this.callCount === 1 ? "" : "s"}, $${this.totalUsd.toFixed(4)} spent (cap $${this.capUsd.toFixed(2)})`;
   }
 }

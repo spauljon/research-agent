@@ -1,6 +1,6 @@
-import Anthropic from "@anthropic-ai/sdk";
 import { CostTracker } from "../cost-tracker.js";
 import { runAgentLoop } from "../agent-loop.js";
+import type { ModelAdapter } from "../model-adapters/types.js";
 import type { Source, StageResult } from "../types.js";
 
 const SYSTEM_PROMPT = `You are a research analyst in the second stage of a multi-stage pipeline.
@@ -21,7 +21,7 @@ Return ONLY JSON in this shape:
 Do not call any tools — pure reasoning over the provided sources.`;
 
 export async function stageAnalyse(
-  client: Anthropic,
+  adapter: ModelAdapter,
   tracker: CostTracker,
   query: string,
   sources: Source[]
@@ -34,7 +34,7 @@ ${sources.map((s, i) => `[${i + 1}] ${s.title}\nURL: ${s.url}\n${s.content}`).jo
 Analyse these sources and return structured JSON.`;
 
   const result = await runAgentLoop(
-    client,
+    adapter,
     tracker,
     SYSTEM_PROMPT,
     userMessage,

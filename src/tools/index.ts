@@ -1,15 +1,15 @@
-import type Anthropic from "@anthropic-ai/sdk";
+import type { ToolDefinition } from "../model-adapters/types.js";
 import { handleSearchWeb } from "./search-web.js";
 import { handleFetchUrl } from "./fetch-url.js";
 import { handleWriteReport } from "./write-report.js";
 
-export const TOOLS: Anthropic.Tool[] = [
+export const TOOLS: ToolDefinition[] = [
   {
     name: "search_web",
     description:
       "Search the web for sources relevant to a query. Returns a list of URLs, titles, and short snippets. " +
       "Use this first to discover candidate sources, then call fetch_url for the ones you want full content from.",
-    input_schema: {
+    inputSchema: {
       type: "object" as const,
       properties: {
         query: { type: "string", description: "The search query" },
@@ -22,7 +22,7 @@ export const TOOLS: Anthropic.Tool[] = [
     name: "fetch_url",
     description:
       "Fetch the full text content of a single URL. Use this after search_web to get the complete article body for sources you want to analyse in depth.",
-    input_schema: {
+    inputSchema: {
       type: "object" as const,
       properties: {
         url: { type: "string", description: "The URL to fetch" },
@@ -34,7 +34,7 @@ export const TOOLS: Anthropic.Tool[] = [
     name: "write_report",
     description:
       "Save the final research report to disk as a markdown file. Call this once analysis is complete.",
-    input_schema: {
+    inputSchema: {
       type: "object" as const,
       properties: {
         filename: { type: "string", description: "Output filename (e.g. report.md)" },

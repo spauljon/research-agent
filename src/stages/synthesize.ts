@@ -1,6 +1,6 @@
-import Anthropic from "@anthropic-ai/sdk";
 import { CostTracker } from "../cost-tracker.js";
 import { runAgentLoop } from "../agent-loop.js";
+import type { ModelAdapter } from "../model-adapters/types.js";
 import type { Source, StageResult } from "../types.js";
 
 const SYSTEM_PROMPT = `You are a research writer in the third stage of a multi-stage pipeline.
@@ -17,7 +17,7 @@ The report must include:
 After calling write_report, confirm the filename and briefly summarise what was written.`;
 
 export async function stageSynthesize(
-  client: Anthropic,
+  adapter: ModelAdapter,
   tracker: CostTracker,
   query: string,
   sources: Source[],
@@ -34,7 +34,7 @@ ${sources.map((s, i) => `[${i + 1}] ${s.title} — ${s.url}`).join("\n")}
 Write the report and save it as report.md.`;
 
   const result = await runAgentLoop(
-    client,
+    adapter,
     tracker,
     SYSTEM_PROMPT,
     userMessage,

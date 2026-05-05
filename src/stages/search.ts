@@ -1,7 +1,7 @@
-import Anthropic from "@anthropic-ai/sdk";
 import { CostTracker } from "../cost-tracker.js";
 import { runAgentLoop } from "../agent-loop.js";
 import { logger } from "../logger.js";
+import type { ModelAdapter } from "../model-adapters/types.js";
 import type { Source, StageResult } from "../types.js";
 
 const SYSTEM_PROMPT = `You are a research assistant in the first stage of a multi-stage pipeline.
@@ -20,12 +20,12 @@ The pipeline already has the content from your fetch_url calls — you just need
 to confirm which URLs you want to include in the final source list.`;
 
 export async function stageSearch(
-  client: Anthropic,
+  adapter: ModelAdapter,
   tracker: CostTracker,
   query: string
 ): Promise<StageResult> {
   const result = await runAgentLoop(
-    client,
+    adapter,
     tracker,
     SYSTEM_PROMPT,
     `Find sources for this research query: "${query}"`,

@@ -1,11 +1,11 @@
 import { join } from "node:path";
 import { readFile } from "node:fs/promises";
-import type { SubabaseMcpClient } from "../mcp-client.js";
+import type { SupabaseMcpClient } from "../mcp-client.js";
 import type { Source, StageResult } from "../types.js";
 import { logger } from "../logger.js";
 
 export async function stagePersist(
-  mcpClient: SubabaseMcpClient,
+  mcpClient: SupabaseMcpClient,
   query: string,
   sources: Source[],
   analysis: unknown
